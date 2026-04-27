@@ -6,6 +6,7 @@ namespace CodeDbConnectionsMetricCollector.Api.Services;
 public interface IRepositoryAnalyzerService
 {
     Task<int> CountDatabaseConnectionsAsync(string repositoryUrl, CancellationToken cancellationToken = default);
+    Task<int> CountDockerComposeDatabasesAsync(string repositoryUrl, CancellationToken cancellationToken = default);
 }
 
 public class RepositoryAnalyzerService : IRepositoryAnalyzerService
@@ -25,6 +26,11 @@ public class RepositoryAnalyzerService : IRepositoryAnalyzerService
         // Entity Framework / Dapper context creation
         new Regex(@"new\s+\w*DbContext\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
         new Regex(@"DbContext\s*\.\s*Database\s*\.\s*GetDbConnection\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new Regex(@"UseSqlServer\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new Regex(@"UseNpgsql\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new Regex(@"UseMySql\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new Regex(@"UseSqlite\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new Regex(@"UseOracle\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
         // Python: SQLAlchemy, psycopg2, pymysql, sqlite3, pyodbc
         new Regex(@"create_engine\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
         new Regex(@"psycopg2\s*\.\s*connect\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
@@ -58,6 +64,24 @@ public class RepositoryAnalyzerService : IRepositoryAnalyzerService
         new Regex(@"gorm\s*\.\s*Open\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase),
     ];
 
+    // Docker image names that indicate a database service.
+    // (?:\S+/)* handles multi-segment registry paths like mcr.microsoft.com/mssql/server:...
+    // (?:[:/\s]|$) allows the db keyword to be followed by a tag (:), sub-path (/), whitespace, or EOL
+    private static readonly Regex[] DockerDatabaseImagePatterns =
+    [
+        new Regex(@"image\s*:\s*(?:\S+/)*(?:mysql|mariadb|postgres|postgis|mongodb|mongo|redis|cassandra|mssql|sqlserver|oracle|couchdb|cockroachdb|elasticsearch|opensearch|neo4j|influxdb|timescaledb|citus|db2|firebird|hana)(?:[:/\s]|$)", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+    ];
+
+    private static readonly Regex[] SpringAppConfigPatterns =
+    [
+        // application.properties
+        new Regex(@"^\s*spring\.datasource\.(?:url|jdbc-url)\s*[:=]", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new Regex(@"^\s*spring\.r2dbc\.url\s*[:=]", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        // application.yml / application.yaml (nested or flattened keys)
+        new Regex(@"^\s*(?:spring\.datasource\.(?:url|jdbc-url)|spring\.r2dbc\.url)\s*:\s*", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new Regex(@"^\s*(?:url|jdbc-url)\s*:\s*(?:jdbc|r2dbc):", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+    ];
+
     private static readonly HashSet<string> IgnoredDirectories = new(StringComparer.OrdinalIgnoreCase)
     {
         "node_modules", ".git", "bin", "obj", "dist", "build", ".gradle", "target", "vendor", "__pycache__"
@@ -66,7 +90,7 @@ public class RepositoryAnalyzerService : IRepositoryAnalyzerService
     private static readonly HashSet<string> SourceExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".cs", ".java", ".py", ".js", ".ts", ".jsx", ".tsx", ".rb", ".php", ".go",
-        ".kt", ".scala", ".cpp", ".c", ".h", ".rs", ".swift"
+        ".kt", ".scala", ".cpp", ".c", ".h", ".rs", ".swift", ".properties", ".yml", ".yaml"
     };
 
     private readonly IHttpClientFactory _httpClientFactory;
@@ -93,6 +117,21 @@ public class RepositoryAnalyzerService : IRepositoryAnalyzerService
         }
     }
 
+    public async Task<int> CountDockerComposeDatabasesAsync(string repositoryUrl, CancellationToken cancellationToken = default)
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "repo-analyzer-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            await DownloadRepositoryAsync(repositoryUrl, tempDir, cancellationToken);
+            return CountDatabasesInDockerCompose(tempDir);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
     private async Task DownloadRepositoryAsync(string repositoryUrl, string targetDir, CancellationToken cancellationToken)
     {
         var zipUrl = BuildZipUrl(repositoryUrl);
@@ -109,6 +148,16 @@ public class RepositoryAnalyzerService : IRepositoryAnalyzerService
             await using var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None);
             await response.Content.CopyToAsync(fs, cancellationToken);
 
+            await fs.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            if (File.Exists(zipPath) && File.GetAttributes(zipPath).HasFlag(FileAttributes.ReadOnly))
+                File.SetAttributes(zipPath, FileAttributes.Normal);
+        }
+
+        try
+        {
             ZipFile.ExtractToDirectory(zipPath, targetDir);
         }
         finally
@@ -148,9 +197,15 @@ public class RepositoryAnalyzerService : IRepositoryAnalyzerService
         {
             try
             {
-                var content = File.ReadAllText(file);
-                foreach (var pattern in ConnectionPatterns)
-                    total += pattern.Matches(content).Count;
+                var patterns = IsSpringApplicationConfig(file) ? SpringAppConfigPatterns : ConnectionPatterns;
+
+                foreach (var line in File.ReadLines(file))
+                {
+                    // Count at most one match per line to avoid inflated counts
+                    // when multiple equivalent patterns match the same statement.
+                    if (patterns.Any(pattern => pattern.IsMatch(line)))
+                        total++;
+                }
             }
             catch (Exception ex)
             {
@@ -158,6 +213,48 @@ public class RepositoryAnalyzerService : IRepositoryAnalyzerService
             }
         }
         return total;
+    }
+
+    private int CountDatabasesInDockerCompose(string directory)
+    {
+        var composeFileNames = new[] { "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml" };
+
+        var composeFiles = Directory
+            .EnumerateFiles(directory, "*", SearchOption.AllDirectories)
+            .Where(f => composeFileNames.Contains(Path.GetFileName(f), StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+        if (composeFiles.Count == 0)
+        {
+            _logger.LogWarning("No docker-compose file found in repository");
+            return 0;
+        }
+
+        int total = 0;
+        foreach (var file in composeFiles)
+        {
+            try
+            {
+                foreach (var line in File.ReadLines(file))
+                {
+                    if (DockerDatabaseImagePatterns.Any(p => p.IsMatch(line)))
+                        total++;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not read docker-compose file {File}", file);
+            }
+        }
+        return total;
+    }
+
+    private static bool IsSpringApplicationConfig(string file)
+    {
+        var fileName = Path.GetFileName(file);
+        return fileName.Equals("application.properties", StringComparison.OrdinalIgnoreCase)
+            || fileName.Equals("application.yml", StringComparison.OrdinalIgnoreCase)
+            || fileName.Equals("application.yaml", StringComparison.OrdinalIgnoreCase);
     }
 
     private static IEnumerable<string> EnumerateSourceFiles(string root)
