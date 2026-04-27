@@ -7,9 +7,10 @@ WORKDIR /src
 COPY ["CodeDbConnectionsMetricCollector.Api.csproj", "."]
 RUN dotnet restore "CodeDbConnectionsMetricCollector.Api.csproj"
 COPY . .
-RUN dotnet publish "CodeDbConnectionsMetricCollector.Api.csproj" -c Release -o /app/publish --no-restore
+RUN dotnet publish "CodeDbConnectionsMetricCollector.Api.csproj" -c Release -o /app/publish
 
 FROM base AS final
 WORKDIR /app
 COPY --from=build /app/publish .
+RUN mkdir -p /app/logs
 ENTRYPOINT ["dotnet", "CodeDbConnectionsMetricCollector.Api.dll"]
